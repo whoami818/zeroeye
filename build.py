@@ -167,6 +167,7 @@ MODULES = [
 ENCRYPTLY_DIR = ROOT / "tools" / "encryptly"
 ENCRYPTLY_BINARIES = {
     "linux-x64": ENCRYPTLY_DIR / "linux-x64" / "encryptly",
+    "windows-x64": ENCRYPTLY_DIR / "windows-x64" / "encryptly.exe",
     "linux-arm64": ENCRYPTLY_DIR / "linux-arm64" / "encryptly",
     "macos-arm64": ENCRYPTLY_DIR / "macos-arm64" / "encryptly",
     "macos-x64": ENCRYPTLY_DIR / "macos-x64" / "encryptly",
@@ -197,6 +198,9 @@ def _normalize_os() -> Optional[str]:
 
 
 def detect_encryptly_platform() -> Optional[str]:
+    # Force windows-x64 in WSL since Linux binary hangs on 9p filesystem
+    if os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop") or os.environ.get("WSL_DISTRO_NAME"):
+        return "windows-x64"
     os_name = _normalize_os()
     arch = _normalize_arch(platform.machine())
     if os_name is None or arch is None:
@@ -223,7 +227,42 @@ def encryptly_platform_help() -> str:
     return f"detected {detected}; available: {available}"
 
 
-def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
+def _run_encryptly_via_windows(encryptly_bin, logd_path, workspace, include_dir=None, max_file_size=61440, timeout=1500):
+    """Run encryptly.exe on Windows native path to avoid UNC path issues in CMD."""
+    import shutil as _shutil
+    win_temp = Path("/mnt/c/Temp/encryptly_build")
+    win_temp.mkdir(parents=True, exist_ok=True)
+    
+    # Copy encryptly binary to Windows path
+    enc_dest = win_temp / encryptly_bin.name
+    _shutil.copy2(encryptly_bin, enc_dest)
+    
+    # Copy content to Windows path
+    src = Path(include_dir or workspace)
+    dst = win_temp / "content"
+    if dst.exists():
+        _shutil.rmtree(dst)
+    _shutil.copytree(src, dst)
+    
+    # Use Windows-native path for output
+    win_out = win_temp / "output.logd"
+    if win_out.exists(): win_out.unlink()
+    
+    # Run via cmd.exe from C:\Temp to avoid UNC CWD
+    cmd = f'encryptly.exe pack output.logd --include content --max-file-size {max_file_size}'
+    result = subprocess.run(
+        ["cmd.exe", "/c", f"cd /d C:\\Temp\\encryptly_build && {cmd}"],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    
+    # Copy back
+    if win_out.exists():
+        _shutil.copy2(win_out, logd_path)
+    
+    return result
+
+
+def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
     """Verify encryptly can create a diagnostic bundle before doing any build work."""
     encryptly_bin = get_encryptly_bin()
     if encryptly_bin is None:
@@ -235,25 +274,22 @@ def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
     try:
         shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
-        (safe_dir / "preflight.txt").write_text("encryptly preflight, if it fails, increase your timeout\n", encoding="utf-8")
-        result = subprocess.run(
-            [
-                str(encryptly_bin),
-                "pack",
-                str(logd_path),
-                "--include",
-                str(workspace),
-                "--max-file-size",
-                "32000",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        # if result.returncode != 0:
-        #     output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
-        #     return False, output
+        (safe_dir / "preflight.txt").write_text("encryptly preflight\n", encoding="utf-8")
+        
+        # Use Windows interop for .exe binaries
+        if str(encryptly_bin).endswith(".exe"):
+            result = _run_encryptly_via_windows(
+                encryptly_bin, logd_path, workspace,
+                include_dir=safe_dir, max_file_size=32000, timeout=timeout
+            )
+            print(f"[DEBUG] Windows interop: exit={result.returncode} stdout={result.stdout[:100]} stderr={result.stderr[:200]}")
+        else:
+            result = subprocess.run(
+                [str(encryptly_bin), "pack", str(logd_path),
+                 "--include", str(workspace), "--max-file-size", "32000"],
+                cwd=str(ROOT), capture_output=True, text=True, timeout=timeout,
+            )
+        
         if not logd_path.exists():
             return False, "encryptly preflight completed without creating a .logd"
         return True, "encryptly preflight passed"
@@ -666,21 +702,18 @@ def generate_logd(
                 log_lines.append(output)
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
-        sr = subprocess.run(
-            [
-                str(encryptly_bin),
-                "pack",
-                str(logd_path),
-                "--include",
-                str(workspace),
-                "--max-file-size",
-                "61440",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=1500,
-        )
+        # Run encryptly via Windows interop or direct
+        if str(encryptly_bin).endswith(".exe"):
+            sr = _run_encryptly_via_windows(
+                encryptly_bin, logd_path, workspace,
+                include_dir=workspace, max_file_size=61440, timeout=1500
+            )
+        else:
+            sr = subprocess.run(
+                [str(encryptly_bin), "pack", str(logd_path),
+                 "--include", str(workspace), "--max-file-size", "61440"],
+                cwd=str(ROOT), capture_output=True, text=True, timeout=300,
+            )
         if sr.returncode != 0:
             error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
             print(
